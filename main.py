@@ -2,13 +2,12 @@ import argparse
 import math
 import os
 import sys
-import tempfile
 import time
-
+ 
 import cv2
 import mediapipe as mp
 import numpy as np
-
+ 
 try:
     from mediapipe.tasks.python.core.base_options import BaseOptions
     from mediapipe.tasks.python.vision.core.vision_task_running_mode import (
@@ -21,7 +20,7 @@ try:
     HAS_POSE_TASKS = True
 except Exception:
     HAS_POSE_TASKS = False
-
+ 
 try:
     mp_face_mesh = mp.solutions.face_mesh
     mp_drawing = mp.solutions.drawing_utils
@@ -32,27 +31,27 @@ except Exception:
     mp_drawing = None
     mp_drawing_styles = None
     HAS_FACE_MESH = False
-
+ 
 try:
     mp_hands = mp.solutions.hands
     HAS_HANDS = True
 except Exception:
     mp_hands = None
     HAS_HANDS = False
-
+ 
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
 MODEL_FILE = "pose_landmarker_lite.task"
-
+ 
 FACE_DETECTOR = None
-
+ 
 POSE_CONNECTIONS = [
     (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
     (11, 23), (12, 24), (23, 24), (23, 25), (25, 27),
     (24, 26), (26, 28), (27, 29), (28, 30), (29, 31), (30, 32),
     (13, 11), (14, 12),
 ]
-
-
+ 
+ 
 def choose_api(backend_name):
     if backend_name is None or backend_name == "auto":
         return cv2.CAP_ANY
@@ -64,8 +63,8 @@ def choose_api(backend_name):
         "any": cv2.CAP_ANY,
     }
     return mapping.get(backend_name.lower(), cv2.CAP_ANY)
-
-
+ 
+ 
 def parse_source(source):
     if source is None:
         return 0
@@ -74,21 +73,21 @@ def parse_source(source):
     if str(source).isdigit():
         return int(source)
     return source
-
-
+ 
+ 
 def is_gui_available():
     if sys.platform.startswith("linux"):
         return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     return True
-
-
+ 
+ 
 def download_model():
     if os.path.exists(MODEL_FILE):
         return MODEL_FILE
-
+ 
     try:
         import urllib.request
-
+ 
         print("Downloading pose model...")
         urllib.request.urlretrieve(MODEL_URL, MODEL_FILE)
         return MODEL_FILE
@@ -96,8 +95,8 @@ def download_model():
         print(f"Could not download model automatically: {exc}")
         print(f"Download the model manually and place it next to code.py as {MODEL_FILE}")
         return None
-
-
+ 
+ 
 def open_capture(source, backend_name="auto"):
     source = parse_source(source)
     api_preference = choose_api(backend_name)
@@ -106,8 +105,8 @@ def open_capture(source, backend_name="auto"):
     except Exception:
         cap = cv2.VideoCapture(source)
     return cap
-
-
+ 
+ 
 def load_face_detector():
     global FACE_DETECTOR
     if FACE_DETECTOR is not None:
@@ -118,8 +117,8 @@ def load_face_detector():
         return None
     FACE_DETECTOR = detector
     return FACE_DETECTOR
-
-
+ 
+ 
 def detect_faces_opencv(frame):
     detector = load_face_detector()
     if detector is None:
@@ -127,8 +126,8 @@ def detect_faces_opencv(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     faces = detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
     return faces
-
-
+ 
+ 
 def draw_pose_annotations(frame, pose_landmarks):
     h, w = frame.shape[:2]
     points = [(int(lm.x * w), int(lm.y * h)) for lm in pose_landmarks]
@@ -137,8 +136,8 @@ def draw_pose_annotations(frame, pose_landmarks):
             cv2.line(frame, points[a], points[b], (0, 255, 0), 2)
     for x, y in points:
         cv2.circle(frame, (x, y), 3, (0, 255, 255), -1)
-
-
+ 
+ 
 def draw_face_overlay(image, faces):
     for (x, y, w, h) in faces:
         cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 255), 2)
@@ -151,8 +150,8 @@ def draw_face_overlay(image, faces):
         mouth_center = (x + int(w * 0.5), y + int(h * 0.7))
         mouth_size = max(10, int(w * 0.2))
         cv2.ellipse(image, mouth_center, (mouth_size, int(h * 0.1)), 0, 0, 180, (0, 0, 255), -1)
-
-
+ 
+ 
 def draw_emoji_eyes(image, landmarks, _face_2d_points):
     if landmarks is None:
         return
@@ -169,8 +168,8 @@ def draw_emoji_eyes(image, landmarks, _face_2d_points):
     cv2.circle(image, (left_eye_x, left_eye_y), 15, (0, 0, 0), -1)
     cv2.circle(image, (right_eye_x, right_eye_y), 30, (255, 255, 255), -1)
     cv2.circle(image, (right_eye_x, right_eye_y), 15, (0, 0, 0), -1)
-
-
+ 
+ 
 def draw_emoji_mouth(image, landmarks, _face_2d_points):
     if landmarks is None:
         return
@@ -184,21 +183,22 @@ def draw_emoji_mouth(image, landmarks, _face_2d_points):
     ], np.int32).reshape((-1, 1, 2))
     cv2.polylines(image, [mouth_points], True, (0, 0, 255), 5)
     cv2.fillPoly(image, [mouth_points], (0, 0, 200))
-
-
+ 
+ 
+# FIX 1: Improved classify_hand_sign — more robust, doesn't depend on thumb x-direction alone
 def classify_hand_sign(active_fingers):
     fingers = set(active_fingers)
     if not fingers:
         return "fist"
-    if fingers == {"Thumb"}:
+    if "Thumb" in fingers and len(fingers) == 1:
         return "thumbs_up"
-    if fingers == {"Index", "Middle"}:
+    if "Index" in fingers and "Middle" in fingers and "Ring" not in fingers and "Pinky" not in fingers:
         return "peace"
     if len(fingers) == 5:
         return "happy"
     return "neutral"
-
-
+ 
+ 
 def get_face_bbox_from_landmarks(landmarks, img_w, img_h):
     xs = [lm.x * img_w for lm in landmarks.landmark]
     ys = [lm.y * img_h for lm in landmarks.landmark]
@@ -207,8 +207,8 @@ def get_face_bbox_from_landmarks(landmarks, img_w, img_h):
     x1 = int(max(xs))
     y1 = int(max(ys))
     return x0, y0, x1 - x0, y1 - y0
-
-
+ 
+ 
 def estimate_emoji_scale(face_bbox, pose_landmarks, img_w, img_h):
     face_w = face_bbox[2]
     if face_w <= 0:
@@ -228,8 +228,8 @@ def estimate_emoji_scale(face_bbox, pose_landmarks, img_w, img_h):
         combined = (face_w + shoulder_w) / 2.0
     scale = combined / 160.0
     return max(0.6, min(scale, 2.5))
-
-
+ 
+ 
 def draw_emoji_face(image, face_bbox, sign, scale=1.0):
     x, y, w, h = face_bbox
     if w <= 0 or h <= 0:
@@ -274,8 +274,8 @@ def draw_emoji_face(image, face_bbox, sign, scale=1.0):
             cv2.circle(image, left_eye, max(eye_r // 3, 4), (0, 0, 0), -1)
             cv2.circle(image, right_eye, max(eye_r // 3, 4), (0, 0, 0), -1)
             cv2.ellipse(image, (cx, cy + int(axes[1] * 0.25)), (eye_r, eye_r // 2), 0, 10, 170, (0, 0, 0), 6)
-
-
+ 
+ 
 def get_head_pose(landmarks, img_w, img_h):
     if landmarks is None:
         return 0, 0, 0
@@ -292,8 +292,8 @@ def get_head_pose(landmarks, img_w, img_h):
     pitch = ((nose_tip[1] - ((left_eye[1] + right_eye[1]) / 2)) / img_h) * 40
     roll = ((mouth_left[1] - mouth_right[1]) / (abs(mouth_left[0] - mouth_right[0]) + 1e-6)) * 30
     return pitch, yaw, roll
-
-
+ 
+ 
 def make_dummy_landmarks(norm_x, norm_y, total=500):
     class LandmarkObj:
         pass
@@ -309,13 +309,13 @@ def make_dummy_landmarks(norm_x, norm_y, total=500):
             lm[i].y = norm_y
     obj.landmark = lm
     return obj
-
-
+ 
+ 
 def draw_info(frame, source_label, fps):
     cv2.putText(frame, f"Source: {source_label}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
     cv2.putText(frame, f"FPS: {fps:.0f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
-
+ 
+ 
 def create_pose_landmarker():
     model_path = download_model()
     if not model_path:
@@ -330,8 +330,8 @@ def create_pose_landmarker():
         min_tracking_confidence=0.5,
     )
     return PoseLandmarker.create_from_options(options)
-
-
+ 
+ 
 def run_body_tracking(source, backend, show_gui, headless, output_path, frame_limit=0):
     if not HAS_POSE_TASKS:
         print("Body tracking requires MediaPipe pose tasks, but they are unavailable.")
@@ -382,8 +382,8 @@ def run_body_tracking(source, backend, show_gui, headless, output_path, frame_li
     if is_gui_available():
         cv2.destroyWindow("Body Tracking")
     return 0
-
-
+ 
+ 
 def run_face_tracking(source, backend, show_gui, headless, output_path, frame_limit=0):
     cap = open_capture(source, backend)
     if not cap.isOpened():
@@ -468,8 +468,8 @@ def run_face_tracking(source, backend, show_gui, headless, output_path, frame_li
     if is_gui_available():
         cv2.destroyWindow("Face Tracking")
     return 0
-
-
+ 
+ 
 def run_finger_tracking(source, backend, show_gui, headless, output_path, frame_limit=0):
     if not HAS_HANDS:
         print("Finger tracking requires MediaPipe Hands, but it is unavailable.")
@@ -509,9 +509,11 @@ def run_finger_tracking(source, backend, show_gui, headless, output_path, frame_
                 for t, k, name in zip(tips, knuckles, finger_names):
                     if hand_landmarks.landmark[t].y < hand_landmarks.landmark[k].y:
                         active_fingers.append(name)
+                # FIX 2: Check both directions for thumb to handle left/right hand
                 thumb_tip = hand_landmarks.landmark[4]
                 thumb_ip = hand_landmarks.landmark[3]
-                if thumb_tip.x > thumb_ip.x:
+                thumb_mcp = hand_landmarks.landmark[2]
+                if abs(thumb_tip.x - thumb_mcp.x) > abs(thumb_tip.y - thumb_mcp.y):
                     active_fingers.append("Thumb")
         cv2.putText(annotated, f"Fingers Up: {len(active_fingers)}", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
         if active_fingers:
@@ -541,8 +543,8 @@ def run_finger_tracking(source, backend, show_gui, headless, output_path, frame_
     if is_gui_available():
         cv2.destroyWindow("Finger Tracking")
     return 0
-
-
+ 
+ 
 def run_all(source, backend, show_gui, headless, output_path, frame_limit=0):
     if not HAS_POSE_TASKS:
         print("All-mode requires MediaPipe pose tasks. Falling back to face+finger only.")
@@ -584,10 +586,12 @@ def run_all(source, backend, show_gui, headless, output_path, frame_limit=0):
                 body_pose_landmarks = result.pose_landmarks[0]
                 for pose_landmarks in result.pose_landmarks:
                     draw_pose_annotations(annotated, pose_landmarks)
-        face_bbox = None
+ 
+        # FIX 3: Work on flip consistently; draw hand landmarks onto flip before face emoji
+        flip = cv2.flip(frame, 1)
         hand_sign = "neutral"
         active_fingers = []
-        flip = cv2.flip(frame, 1)
+ 
         if hands is not None:
             small_frame = cv2.resize(flip, (960, 540))
             rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
@@ -596,18 +600,21 @@ def run_all(source, backend, show_gui, headless, output_path, frame_limit=0):
             rgb_small.flags.writeable = True
             if hand_results.multi_hand_landmarks:
                 for hand_landmarks in hand_results.multi_hand_landmarks:
-                    mp_drawing.draw_landmarks(annotated, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                    # FIX 4: Draw hand landmarks on flip, not annotated, so they survive the final flip
+                    mp_drawing.draw_landmarks(flip, hand_landmarks, mp_hands.HAND_CONNECTIONS)
                     tips = [8, 12, 16, 20]
                     knuckles = [6, 10, 14, 18]
                     finger_names = ["Index", "Middle", "Ring", "Pinky"]
                     for t, k, name in zip(tips, knuckles, finger_names):
                         if hand_landmarks.landmark[t].y < hand_landmarks.landmark[k].y:
                             active_fingers.append(name)
+                    # FIX 2: More robust thumb detection
                     thumb_tip = hand_landmarks.landmark[4]
-                    thumb_ip = hand_landmarks.landmark[3]
-                    if thumb_tip.x > thumb_ip.x:
+                    thumb_mcp = hand_landmarks.landmark[2]
+                    if abs(thumb_tip.x - thumb_mcp.x) > abs(thumb_tip.y - thumb_mcp.y):
                         active_fingers.append("Thumb")
             hand_sign = classify_hand_sign(active_fingers)
+ 
         if face_mesh is not None:
             rgb_face = cv2.cvtColor(flip, cv2.COLOR_BGR2RGB)
             face_results = face_mesh.process(rgb_face)
@@ -623,31 +630,11 @@ def run_all(source, backend, show_gui, headless, output_path, frame_limit=0):
                 emoji_scale = estimate_emoji_scale(face, body_pose_landmarks, flip.shape[1], flip.shape[0])
                 draw_emoji_face(flip, face, hand_sign, emoji_scale)
             annotated = cv2.flip(flip, 1)
-        # Finger
-        if hands is not None:
-            flip = cv2.flip(frame, 1)
-            small_frame = cv2.resize(flip, (960, 540))
-            rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-            rgb_small.flags.writeable = False
-            results = hands.process(rgb_small)
-            rgb_small.flags.writeable = True
-            active_fingers = []
-            if results.multi_hand_landmarks:
-                for hand_landmarks in results.multi_hand_landmarks:
-                    mp_drawing.draw_landmarks(annotated, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-                    tips = [8, 12, 16, 20]
-                    knuckles = [6, 10, 14, 18]
-                    finger_names = ["Index", "Middle", "Ring", "Pinky"]
-                    for t, k, name in zip(tips, knuckles, finger_names):
-                        if hand_landmarks.landmark[t].y < hand_landmarks.landmark[k].y:
-                            active_fingers.append(name)
-                    thumb_tip = hand_landmarks.landmark[4]
-                    thumb_ip = hand_landmarks.landmark[3]
-                    if thumb_tip.x > thumb_ip.x:
-                        active_fingers.append("Thumb")
-            cv2.putText(annotated, f"Fingers Up: {len(active_fingers)}", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-            if active_fingers:
-                cv2.putText(annotated, ", ".join(active_fingers), (30, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+ 
+        cv2.putText(annotated, f"Fingers Up: {len(active_fingers)}", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+        if active_fingers:
+            cv2.putText(annotated, ", ".join(active_fingers), (30, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+ 
         fps = 1.0 / (time.time() - prev_time) if time.time() > prev_time else 0.0
         prev_time = time.time()
         draw_info(annotated, "All", fps)
@@ -677,8 +664,8 @@ def run_all(source, backend, show_gui, headless, output_path, frame_limit=0):
     if is_gui_available():
         cv2.destroyWindow("Combined Tracking")
     return 0
-
-
+ 
+ 
 def list_cameras(max_index=10):
     available = []
     for index in range(max_index + 1):
@@ -692,20 +679,20 @@ def list_cameras(max_index=10):
             available.append(index)
         cap.release()
     return available
-
-
+ 
+ 
 def main():
     parser = argparse.ArgumentParser(description="Unified body, face, and finger tracking demo")
     parser.add_argument("--mode", choices=["body", "face", "finger", "all"], default="all", help="Which tracking mode to run")
     parser.add_argument("--camera", default=0, help="Camera index or device path to use")
     parser.add_argument("--input", default=None, help="Video file input path (overrides --camera)")
     parser.add_argument("--backend", default="auto", help="OpenCV backend to use: auto, v4l2, dshow, avfoundation, gstreamer")
-    parser.add_argument("--show-gui", action="store_true", help="Show OpenCV display windows when available")
+    parser.add_argument("--show-gui", action="store_true", default=True, help="Show OpenCV display windows when available")
     parser.add_argument("--headless", action="store_true", help="Run a short headless processing test and optionally save one annotated frame")
     parser.add_argument("--output", default="output.png", help="Output path when running headless")
     parser.add_argument("--list-cameras", action="store_true", help="List available camera indices and exit")
     args = parser.parse_args()
-
+ 
     if args.list_cameras:
         cams = list_cameras(20)
         if cams:
@@ -713,7 +700,7 @@ def main():
         else:
             print("No cameras found.")
         return 0
-
+ 
     source = args.input if args.input else args.camera
     frame_limit = 30 if args.headless else 0
     if args.mode == "body":
@@ -723,7 +710,7 @@ def main():
     if args.mode == "finger":
         return run_finger_tracking(source, args.backend, args.show_gui, args.headless, args.output, frame_limit)
     return run_all(source, args.backend, args.show_gui, args.headless, args.output, frame_limit)
-
-
+ 
+ 
 if __name__ == "__main__":
     sys.exit(main())
