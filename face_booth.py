@@ -367,15 +367,31 @@ def draw_right_panel(frame, album_faces, current_expression, settings=None):
     H, W = frame.shape[:2]
     panel_w = PANEL_WIDTH
     
-    # Create combined canvas of size (H, W + panel_w)
-    canvas = np.zeros((H, W + panel_w, 3), dtype=np.uint8)
+    scale = settings["picture_scale"] if settings else 1.0
+    
+    # Calculate box sizes using base dimensions
+    slot_h_base = H // 4
+    box_w_base = min(110, int(slot_h_base * 0.85))
+    
+    # Apply scale
+    H_scaled = int(H * scale)
+    W_scaled = int(W * scale)
+    panel_w_scaled = int(panel_w * scale)
+    box_w = int(box_w_base * scale)
+    box_h = box_w
+    
+    # Resize camera feed frame
+    frame_resized = cv2.resize(frame, (W_scaled, H_scaled))
+    
+    # Create combined canvas of size (H_scaled, W_scaled + panel_w_scaled)
+    canvas = np.zeros((H_scaled, W_scaled + panel_w_scaled, 3), dtype=np.uint8)
     # Copy original frame to the left side
-    canvas[:, :W] = frame
+    canvas[:, :W_scaled] = frame_resized
     # Color the right panel dark gray
-    canvas[:, W:] = (30, 30, 30) # Dark gray background
+    canvas[:, W_scaled:] = (30, 30, 30) # Dark gray background
     
     # 4 Slots
-    slot_h = H // 4
+    slot_h = H_scaled // 4
     expressions = [
         ("Happy", "😊", "happy"),
         ("Sad", "☹️", "sad"),
@@ -383,36 +399,32 @@ def draw_right_panel(frame, album_faces, current_expression, settings=None):
         ("Surprise", "😲", "surprise")
     ]
     
-    # Dynamic box sizing for side-by-side layout (larger boxes)
-    box_w = min(110, int(slot_h * 0.85))
-    if settings:
-        box_w = int(box_w * settings["picture_scale"])
-    box_h = box_w
-    
     for idx, (label, emoji, key) in enumerate(expressions):
         # Calculate slot y-bounds
         y_start = idx * slot_h
         
         # Position box on the right side of the panel
-        bx = W + panel_w - box_w - 15
+        bx = W_scaled + panel_w_scaled - box_w - int(15 * scale)
         by = y_start + (slot_h - box_h) // 2
         
         # Draw slot header / label centered vertically on the left with larger text
-        ty = y_start + slot_h // 2 + 5
+        ty = y_start + slot_h // 2 + int(5 * scale)
         font_sz = 16
         if settings:
             font_sz = int(font_sz * settings["text_scale"])
-        draw_text_with_emoji(canvas, label, emoji, W + 15, ty, font_size=font_sz)
+        draw_text_with_emoji(canvas, label, emoji, W_scaled + int(15 * scale), ty, font_size=font_sz)
         
         # Draw face crop if available, otherwise placeholder
-        if key in album_faces:
-            crop = album_faces[key]
-            if crop is not None and crop.size > 0:
-                crop_resized = cv2.resize(crop, (box_w, box_h))
-                safe_copy_roi(canvas, crop_resized, bx, by)
-                # Draw green border if it's the active one
-                border_color = (0, 255, 0) if current_expression == label else (150, 150, 150)
-                cv2.rectangle(canvas, (bx-1, by-1), (bx+box_w, by+box_h), border_color, 2)
+        crop = album_faces.get(key, None)
+        if (crop is None or crop.size == 0 or np.all(crop == 0)) and os.path.exists(f"{key}.png"):
+            crop = cv2.imread(f"{key}.png")
+            
+        if crop is not None and crop.size > 0 and not np.all(crop == 0):
+            crop_resized = cv2.resize(crop, (box_w, box_h))
+            safe_copy_roi(canvas, crop_resized, bx, by)
+            # Draw green border if it's the active one
+            border_color = (0, 255, 0) if current_expression == label else (150, 150, 150)
+            cv2.rectangle(canvas, (bx-1, by-1), (bx+box_w, by+box_h), border_color, 2)
         else:
             # Placeholder: gray square
             cv2.rectangle(canvas, (bx, by), (bx+box_w, by+box_h), (80, 80, 80), 1)
@@ -431,9 +443,14 @@ BOOTH_STEPS = {
     3: ("Surprise", "surprise", "Challenge 4: Make a SURPRISE face! 😲")
 }
 
-def draw_instructions_banner(frame, step_idx, flash_frames):
+def draw_instructions_banner(frame, step_idx, flash_frames, settings=None):
     H, W = frame.shape[:2]
     banner_h = 50
+    font_scale = 0.55
+    if settings:
+        banner_h = int(banner_h * settings["text_scale"])
+        font_scale *= settings["text_scale"]
+        
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, H - banner_h), (W, H), (15, 15, 15), -1)
     cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, dst=frame)
@@ -449,10 +466,10 @@ def draw_instructions_banner(frame, step_idx, flash_frames):
         text = "Album Complete! Press 'r' to reset or 'q' to quit."
         color = (0, 255, 255)
         
-    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
     tx = (W - tw) // 2
     ty = H - (banner_h - th) // 2
-    cv2.putText(frame, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
+    cv2.putText(frame, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1, cv2.LINE_AA)
     
     if flash_frames > 0:
         flash_overlay = np.ones((H, W, 3), dtype=np.uint8) * 255
@@ -930,7 +947,7 @@ def run_face_tracking(source, backend, show_gui, headless, output_path, frame_li
                 booth_state += 1
                 
             # Draw HUD & Instructions Banner first on annotated
-            draw_instructions_banner(annotated, booth_state, flash_frames)
+            draw_instructions_banner(annotated, booth_state, flash_frames, booth_settings)
             
             fps = 1.0/(time.time()-prev_time) if time.time()>prev_time else 0.0
             prev_time = time.time()
@@ -954,6 +971,7 @@ def run_face_tracking(source, backend, show_gui, headless, output_path, frame_li
             
         if show_gui and is_gui_available():
             cv2.imshow(WIN, annotated)
+            cv2.resizeWindow(WIN, annotated.shape[1], annotated.shape[0])
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"): break
             if key == ord("f"): toggle_fullscreen(WIN)
@@ -1209,7 +1227,7 @@ def run_all(source, backend, show_gui, headless, output_path, frame_limit=0):
                 booth_state += 1
  
             # Draw HUD & Instructions Banner first on flip
-            draw_instructions_banner(flip, booth_state, flash_frames)
+            draw_instructions_banner(flip, booth_state, flash_frames, booth_settings)
  
             # ── HUD ──
             cv2.putText(flip, f"Fingers Up: {len(active_fingers)}", (10,120),
@@ -1241,6 +1259,7 @@ def run_all(source, backend, show_gui, headless, output_path, frame_limit=0):
  
         if show_gui and is_gui_available():
             cv2.imshow(WIN, annotated)
+            cv2.resizeWindow(WIN, annotated.shape[1], annotated.shape[0])
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"): break
             if key == ord("f"): toggle_fullscreen(WIN)
