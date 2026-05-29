@@ -10,7 +10,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
  
-# ── Pose Landmarker (Tasks API) ──────────────────────────────────────────────
+# ── Tasks Vision Imports & Setup ─────────────────────────────────────────────
 try:
     from mediapipe.tasks.python.core.base_options import BaseOptions
     from mediapipe.tasks.python.vision.core.vision_task_running_mode import (
@@ -20,31 +20,41 @@ try:
         PoseLandmarker,
         PoseLandmarkerOptions,
     )
+    from mediapipe.tasks.python.vision.face_landmarker import (
+        FaceLandmarker,
+        FaceLandmarkerOptions,
+        FaceLandmarksConnections,
+    )
+    from mediapipe.tasks.python.vision.hand_landmarker import (
+        HandLandmarker,
+        HandLandmarkerOptions,
+        HandLandmarksConnections,
+    )
+    from mediapipe.tasks.python.vision import drawing_utils as mp_drawing
+    from mediapipe.tasks.python.vision import drawing_styles as mp_drawing_styles
+
     HAS_POSE_TASKS = True
-except Exception:
+    HAS_FACE_MESH = True  # backward compatibility alias
+    HAS_HANDS = True      # backward compatibility alias
+except Exception as e:
+    print(f"Error initializing modern Tasks API: {e}")
     HAS_POSE_TASKS = False
- 
-# ── Face Mesh ────────────────────────────────────────────────────────────────
-try:
-    mp_face_mesh       = mp.solutions.face_mesh
-    mp_drawing         = mp.solutions.drawing_utils
-    mp_drawing_styles  = mp.solutions.drawing_styles
-    HAS_FACE_MESH      = True
-except Exception:
-    mp_face_mesh = mp_drawing = mp_drawing_styles = None
     HAS_FACE_MESH = False
- 
-# ── Hands ────────────────────────────────────────────────────────────────────
-try:
-    mp_hands  = mp.solutions.hands
-    HAS_HANDS = True
-except Exception:
-    mp_hands  = None
     HAS_HANDS = False
- 
+    mp_drawing = mp_drawing_styles = None
+
 # ── Constants ────────────────────────────────────────────────────────────────
-MODEL_URL  = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
-MODEL_FILE = "pose_landmarker_lite.task"
+POSE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+POSE_MODEL_FILE = "pose_landmarker_lite.task"
+
+FACE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+FACE_MODEL_FILE = "face_landmarker.task"
+
+HAND_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+HAND_MODEL_FILE = "hand_landmarker.task"
+
+MODEL_URL  = POSE_MODEL_URL
+MODEL_FILE = POSE_MODEL_FILE
  
 FACE_DETECTOR = None
  
@@ -62,6 +72,16 @@ SIGN_LABELS = {
     "surprise":  "All 5     -> Surprise",
     "neutral":   "Other     -> Neutral",
 }
+
+EMOJI_FONT_PATH = None
+for p in [
+    "/System/Library/Fonts/Apple Color Emoji.ttc",
+    "/System/Library/Fonts/Supplemental/Apple Color Emoji.ttc",
+    "/Library/Fonts/Apple Color Emoji.ttc"
+]:
+    if os.path.exists(p):
+        EMOJI_FONT_PATH = p
+        break
  
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def choose_api(backend_name):
@@ -162,16 +182,17 @@ def draw_info(frame, label, fps):
     cv2.putText(frame, f"FPS: {fps:.0f}",  (10,60),  cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
  
  
-def draw_sign_label(frame, sign):
-    label = SIGN_LABELS.get(sign, sign)
+def draw_expression_label(frame, label):
+    text = f"Expression: {label}"
     fw    = frame.shape[1]
-    (tw,_),_ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
-    cv2.putText(frame, label, (fw-tw-10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,255,255), 2)
+    (tw,_),_ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+    cv2.putText(frame, text, (fw-tw-10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,255,255), 2)
  
  
 def get_face_bbox_from_landmarks(landmarks, img_w, img_h):
-    xs = [lm.x*img_w for lm in landmarks.landmark]
-    ys = [lm.y*img_h for lm in landmarks.landmark]
+    lms = getattr(landmarks, "landmark", landmarks)
+    xs = [lm.x*img_w for lm in lms]
+    ys = [lm.y*img_h for lm in lms]
     x0,y0 = int(min(xs)), int(min(ys))
     x1,y1 = int(max(xs)), int(max(ys))
     return x0, y0, x1-x0, y1-y0
@@ -193,74 +214,102 @@ def estimate_emoji_scale(face_bbox, pose_landmarks, img_w, img_h):
     return max(0.6, min(combined / 160.0, 2.5))
  
  
-def draw_emoji_face(image, face_bbox, sign, scale=1.0):
+from PIL import Image, ImageDraw, ImageFont
+
+def draw_emoji_face_pillow(frame, face_bbox, emoji_char, scale=1.0):
     x, y, w, h = face_bbox
     if w <= 0 or h <= 0:
         return
-    cx   = x + w // 2
-    cy   = y + h // 2
-    axes = (max(30, int(w * 0.75 * scale)), max(30, int(h * 0.9 * scale)))
- 
-    colours = {
-        "fist":      (60,  60,  220),
-        "thumbs_up": (0,   180, 255),
-        "peace":     (0,   200, 120),
-        "surprise":  (0,   255, 255),
-        "neutral":   (180, 200, 0  ),
+    
+    target_size = int(max(w, h) * 1.4 * scale)
+    if target_size < 10:
+        target_size = 10
+        
+    base_size = 160
+    
+    try:
+        if EMOJI_FONT_PATH:
+            font = ImageFont.truetype(EMOJI_FONT_PATH, size=base_size)
+        else:
+            font = ImageFont.load_default()
+            
+        canvas = Image.new("RGBA", (base_size + 40, base_size + 40), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(canvas)
+        
+        try:
+            bbox = draw.textbbox((0, 0), emoji_char, font=font)
+            ew = bbox[2] - bbox[0]
+            eh = bbox[3] - bbox[1]
+            ex = (canvas.width - ew) // 2 - bbox[0]
+            ey = (canvas.height - eh) // 2 - bbox[1]
+        except Exception:
+            ex, ey = 20, 20
+            
+        draw.text((ex, ey), emoji_char, font=font, embedded_color=True)
+        
+        resized_emoji = canvas.resize((target_size, target_size), Image.Resampling.LANCZOS)
+        
+        pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        
+        cx = x + w // 2
+        cy = y + h // 2
+        px = cx - target_size // 2
+        py = cy - target_size // 2
+        
+        pil_frame.paste(resized_emoji, (px, py), resized_emoji)
+        cv2.cvtColor(np.array(pil_frame), cv2.COLOR_RGB2BGR, dst=frame)
+        
+    except Exception as e:
+        cv2.putText(frame, emoji_char, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 255), 4)
+        print(f"Pillow drawing error: {e}")
+
+
+def draw_emoji_face(image, face_bbox, sign, scale=1.0):
+    # Compatibility wrapper for legacy hand gesture code
+    emoji_map = {
+        "fist":      "😠",
+        "thumbs_up": "😉",
+        "peace":     "😊",
+        "surprise":  "😲",
+        "neutral":   "😐",
     }
-    cv2.ellipse(image, (cx,cy), axes, 0, 0, 360, colours.get(sign,(0,255,255)), -1)
- 
-    eye_y     = cy - int(axes[1] * 0.22)
-    eye_dx    = int(axes[0] * 0.35)
-    eye_r     = max(8, int(axes[0] * 0.11))
-    left_eye  = (cx - eye_dx, eye_y)
-    right_eye = (cx + eye_dx, eye_y)
-    mouth_cy  = cy + int(axes[1] * 0.25)
- 
-    if sign == "fist":
-        # X eyes + flat mouth = angry
-        for ex,ey in [left_eye, right_eye]:
-            cv2.line(image,(ex-eye_r,ey-eye_r),(ex+eye_r,ey+eye_r),(0,0,0),4)
-            cv2.line(image,(ex+eye_r,ey-eye_r),(ex-eye_r,ey+eye_r),(0,0,0),4)
-        cv2.line(image,(cx-eye_r*2,mouth_cy),(cx+eye_r*2,mouth_cy),(0,0,0),6)
- 
-    elif sign == "thumbs_up":
-        # One eye open, one wink + smile
-        cv2.circle(image, left_eye,  eye_r, (255,255,255), -1)
-        cv2.circle(image, left_eye,  max(eye_r//3,4), (0,0,0), -1)
-        cv2.line(image,
-                 (right_eye[0]-eye_r, right_eye[1]),
-                 (right_eye[0]+eye_r, right_eye[1]), (0,0,0), 4)
-        cv2.ellipse(image,(cx,mouth_cy),(eye_r*2,eye_r),0,10,170,(0,0,0),6)
- 
-    elif sign == "peace":
-        # Open eyes + big smile
-        cv2.circle(image, left_eye,  eye_r, (255,255,255), -1)
-        cv2.circle(image, right_eye, eye_r, (255,255,255), -1)
-        cv2.circle(image, left_eye,  max(eye_r//3,4), (0,0,0), -1)
-        cv2.circle(image, right_eye, max(eye_r//3,4), (0,0,0), -1)
-        cv2.ellipse(image,(cx,mouth_cy),(eye_r*2,eye_r),0,10,170,(0,0,0),6)
- 
-    elif sign == "surprise":
-        # Big round eyes + O mouth
-        cv2.circle(image, left_eye,  eye_r+4, (255,255,255), -1)
-        cv2.circle(image, right_eye, eye_r+4, (255,255,255), -1)
-        cv2.circle(image, left_eye,  max(eye_r//2,5), (0,0,0), -1)
-        cv2.circle(image, right_eye, max(eye_r//2,5), (0,0,0), -1)
-        cv2.circle(image, (cx,mouth_cy), max(eye_r+4,16), (0,0,0), -1)
- 
-    else:  # neutral
-        cv2.circle(image, left_eye,  eye_r, (255,255,255), -1)
-        cv2.circle(image, right_eye, eye_r, (255,255,255), -1)
-        cv2.circle(image, left_eye,  max(eye_r//3,4), (0,0,0), -1)
-        cv2.circle(image, right_eye, max(eye_r//3,4), (0,0,0), -1)
-        cv2.ellipse(image,(cx,mouth_cy),(eye_r*2,eye_r),0,10,170,(0,0,0),6)
+    emoji_char = emoji_map.get(sign, "😐")
+    draw_emoji_face_pillow(image, face_bbox, emoji_char, scale)
+
+
+def classify_expression(blendshapes):
+    scores = {b.category_name: b.score for b in blendshapes}
+    
+    smile = (scores.get("mouthSmileLeft", 0.0) + scores.get("mouthSmileRight", 0.0)) / 2.0
+    frown = (scores.get("mouthFrownLeft", 0.0) + scores.get("mouthFrownRight", 0.0)) / 2.0
+    angry = (scores.get("browDownLeft", 0.0) + scores.get("browDownRight", 0.0)) / 2.0
+    surprise = scores.get("jawOpen", 0.0)
+    
+    triggers = {
+        "smile": (smile, "😊", "Happy"),
+        "frown": (frown, "☹️", "Sad"),
+        "angry": (angry, "😠", "Angry"),
+        "surprise": (surprise, "😲", "Surprise")
+    }
+    
+    best_cat = None
+    best_score = 0.35 # threshold
+    
+    for cat, (score, emoji, label) in triggers.items():
+        if score > best_score:
+            best_score = score
+            best_cat = cat
+            
+    if best_cat:
+        return triggers[best_cat][1], triggers[best_cat][2]
+    
+    return "😐", "Neutral"
  
  
 # ── Hand detection helpers ───────────────────────────────────────────────────
 def detect_fingers(hand_landmarks):
     """Return list of finger names that are extended."""
-    lm             = hand_landmarks.landmark
+    lm             = getattr(hand_landmarks, "landmark", hand_landmarks)
     active         = []
     finger_tips    = [8,  12, 16, 20]
     finger_pips    = [6,  10, 14, 18]
@@ -293,13 +342,7 @@ def classify_hand_sign(active_fingers):
  
  
 def create_hands():
-    return mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=2,
-        model_complexity=0,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
+    return create_hand_landmarker()
  
  
 # ── Pose landmarker ──────────────────────────────────────────────────────────
@@ -317,6 +360,65 @@ def create_pose_landmarker():
         min_tracking_confidence=0.5,
     )
     return PoseLandmarker.create_from_options(options)
+
+
+def download_face_model():
+    if os.path.exists(FACE_MODEL_FILE):
+        return FACE_MODEL_FILE
+    try:
+        import urllib.request
+        print("Downloading face model…")
+        urllib.request.urlretrieve(FACE_MODEL_URL, FACE_MODEL_FILE)
+        return FACE_MODEL_FILE
+    except Exception as exc:
+        print(f"Could not download face model: {exc}")
+        return None
+
+
+def download_hand_model():
+    if os.path.exists(HAND_MODEL_FILE):
+        return HAND_MODEL_FILE
+    try:
+        import urllib.request
+        print("Downloading hand model…")
+        urllib.request.urlretrieve(HAND_MODEL_URL, HAND_MODEL_FILE)
+        return HAND_MODEL_FILE
+    except Exception as exc:
+        print(f"Could not download hand model: {exc}")
+        return None
+
+
+def create_face_landmarker():
+    model_path = download_face_model()
+    if not model_path:
+        return None
+    base_options = BaseOptions(model_asset_path=model_path)
+    options = FaceLandmarkerOptions(
+        base_options=base_options,
+        running_mode=VisionTaskRunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+        output_face_blendshapes=True,
+    )
+    return FaceLandmarker.create_from_options(options)
+
+
+def create_hand_landmarker():
+    model_path = download_hand_model()
+    if not model_path:
+        return None
+    base_options = BaseOptions(model_asset_path=model_path)
+    options = HandLandmarkerOptions(
+        base_options=base_options,
+        running_mode=VisionTaskRunningMode.VIDEO,
+        num_hands=2,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    return HandLandmarker.create_from_options(options)
  
  
 # ── Tracking modes ───────────────────────────────────────────────────────────
@@ -383,13 +485,11 @@ def run_face_tracking(source, backend, show_gui, headless, output_path, frame_li
     if show_gui and is_gui_available() and not headless:
         make_resizable_window(WIN)
  
-    face_mesh = None
+    face_landmarker = None
     if HAS_FACE_MESH:
-        face_mesh = mp_face_mesh.FaceMesh(
-            max_num_faces=1, refine_landmarks=True,
-            min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        face_landmarker = create_face_landmarker()
     else:
-        print("Face Mesh unavailable; using OpenCV fallback.")
+        print("Face landmarker unavailable; using OpenCV fallback.")
  
     frame_index = 0
     prev_time   = time.time()
@@ -401,23 +501,31 @@ def run_face_tracking(source, backend, show_gui, headless, output_path, frame_li
         frame     = cv2.flip(frame, 1)
         annotated = frame.copy()
  
-        if face_mesh:
-            rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = face_mesh.process(rgb)
-            if results.multi_face_landmarks:
-                for fl in results.multi_face_landmarks:
+        if face_landmarker:
+            rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            timestamp_ms = int(frame_index * 1000 / max(1, cap.get(cv2.CAP_PROP_FPS) or 30))
+            result = face_landmarker.detect_for_video(mp_image, timestamp_ms)
+            if result.face_landmarks:
+                for fl in result.face_landmarks:
                     mp_drawing.draw_landmarks(
-                        frame, fl, mp_face_mesh.FACEMESH_TESSELATION,
+                        annotated, fl, FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION,
                         None, mp_drawing_styles.get_default_face_mesh_tesselation_style())
                     mp_drawing.draw_landmarks(
-                        frame, fl, mp_face_mesh.FACEMESH_CONTOURS,
+                        annotated, fl, FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
                         None, mp_drawing_styles.get_default_face_mesh_contours_style())
-                    mp_drawing.draw_landmarks(
-                        frame, fl, mp_face_mesh.FACEMESH_IRISES,
-                        None, mp_drawing_styles.get_default_face_mesh_iris_connections_style())
-                annotated = frame
+                    
+                    emoji_char = "😐"
+                    expression = "Neutral"
+                    if result.face_blendshapes:
+                        emoji_char, expression = classify_expression(result.face_blendshapes[0])
+                    
+                    face_bbox = get_face_bbox_from_landmarks(fl, frame.shape[1], frame.shape[0])
+                    draw_emoji_face_pillow(annotated, face_bbox, emoji_char, scale=1.0)
         else:
-            draw_face_overlay(annotated, detect_faces_opencv(frame))
+            faces = detect_faces_opencv(frame)
+            for face in faces:
+                draw_emoji_face_pillow(annotated, face, "😐", scale=1.0)
  
         fps = 1.0/(time.time()-prev_time) if time.time()>prev_time else 0.0
         prev_time = time.time()
@@ -439,20 +547,23 @@ def run_face_tracking(source, backend, show_gui, headless, output_path, frame_li
         else:
             if frame_limit and frame_index>=frame_limit: break
  
-    if face_mesh: face_mesh.close()
+    if face_landmarker: face_landmarker.close()
     cap.release(); cv2.destroyAllWindows()
     return 0
  
  
 def run_finger_tracking(source, backend, show_gui, headless, output_path, frame_limit=0):
     if not HAS_HANDS:
-        print("Finger tracking requires MediaPipe Hands."); return 1
+        print("Finger tracking requires MediaPipe HandLandmarker."); return 1
     cap = open_capture(source, backend)
     if not cap.isOpened():
         print(f"Could not open: {source}"); return 1
  
     WIN   = "Finger Tracking"
-    hands = create_hands()
+    hands = create_hand_landmarker()
+    if hands is None:
+        cap.release(); return 1
+        
     if show_gui and is_gui_available() and not headless:
         make_resizable_window(WIN)
  
@@ -465,16 +576,19 @@ def run_finger_tracking(source, backend, show_gui, headless, output_path, frame_
         if not ret: break
         frame = cv2.flip(frame, 1)
         rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb.flags.writeable = False
-        results = hands.process(rgb)
-        rgb.flags.writeable = True
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        timestamp_ms = int(frame_index * 1000 / max(1, cap.get(cv2.CAP_PROP_FPS) or 30))
+        result = hands.detect_for_video(mp_image, timestamp_ms)
  
         annotated      = frame.copy()
         active_fingers = []
  
-        if results.multi_hand_landmarks:
-            for hl in results.multi_hand_landmarks:
-                mp_drawing.draw_landmarks(annotated, hl, mp_hands.HAND_CONNECTIONS)
+        if result.hand_landmarks:
+            for hl in result.hand_landmarks:
+                mp_drawing.draw_landmarks(
+                    annotated, hl, HandLandmarksConnections.HAND_CONNECTIONS,
+                    mp_drawing_styles.get_default_hand_landmarks_style(),
+                    mp_drawing_styles.get_default_hand_connections_style())
                 active_fingers.extend(detect_fingers(hl))
  
         cv2.putText(annotated, f"Fingers Up: {len(active_fingers)}", (30,80),
@@ -508,22 +622,13 @@ def run_finger_tracking(source, backend, show_gui, headless, output_path, frame_
  
  
 def run_all(source, backend, show_gui, headless, output_path, frame_limit=0):
-    if not HAS_POSE_TASKS:
-        print("Pose tasks unavailable — running face+hand only.")
- 
     cap = open_capture(source, backend)
     if not cap.isOpened():
         print(f"Could not open: {source}"); return 1
  
     pose_landmarker = create_pose_landmarker() if HAS_POSE_TASKS else None
- 
-    face_mesh = None
-    if HAS_FACE_MESH:
-        face_mesh = mp_face_mesh.FaceMesh(
-            max_num_faces=1, refine_landmarks=True,
-            min_detection_confidence=0.5, min_tracking_confidence=0.5)
- 
-    hands = create_hands() if HAS_HANDS else None
+    face_landmarker = create_face_landmarker() if HAS_FACE_MESH else None
+    hand_landmarker = create_hand_landmarker() if HAS_HANDS else None
  
     WIN = "Combined Tracking"
     if show_gui and is_gui_available() and not headless:
@@ -543,9 +648,8 @@ def run_all(source, backend, show_gui, headless, output_path, frame_limit=0):
         if pose_landmarker is not None:
             rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            result   = pose_landmarker.detect_for_video(
-                mp_image,
-                int(frame_index*1000/max(1, cap.get(cv2.CAP_PROP_FPS) or 30)))
+            timestamp_ms = int(frame_index * 1000 / max(1, cap.get(cv2.CAP_PROP_FPS) or 30))
+            result   = pose_landmarker.detect_for_video(mp_image, timestamp_ms)
             if getattr(result,"pose_landmarks",None):
                 body_pose_landmarks = result.pose_landmarks[0]
                 for pl in result.pose_landmarks:
@@ -553,40 +657,46 @@ def run_all(source, backend, show_gui, headless, output_path, frame_limit=0):
  
         # ── Flip for hand + face (mirror = natural) ──
         flip           = cv2.flip(frame, 1)
-        hand_sign      = "fist"
         active_fingers = []
+        emoji_char     = "😐"
+        expression     = "Neutral"
  
         # ── Hand detection ──
-        if hands is not None:
+        if hand_landmarker is not None:
             rgb_h = cv2.cvtColor(flip, cv2.COLOR_BGR2RGB)
-            rgb_h.flags.writeable = False
-            hand_results = hands.process(rgb_h)
-            rgb_h.flags.writeable = True
+            mp_image_h = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_h)
+            timestamp_ms = int(frame_index * 1000 / max(1, cap.get(cv2.CAP_PROP_FPS) or 30))
+            hand_results = hand_landmarker.detect_for_video(mp_image_h, timestamp_ms)
  
-            if hand_results.multi_hand_landmarks:
-                for hl in hand_results.multi_hand_landmarks:
-                    mp_drawing.draw_landmarks(flip, hl, mp_hands.HAND_CONNECTIONS)
+            if hand_results.hand_landmarks:
+                for hl in hand_results.hand_landmarks:
+                    mp_drawing.draw_landmarks(
+                        flip, hl, HandLandmarksConnections.HAND_CONNECTIONS,
+                        mp_drawing_styles.get_default_hand_landmarks_style(),
+                        mp_drawing_styles.get_default_hand_connections_style())
                     active_fingers.extend(detect_fingers(hl))
  
-            hand_sign = classify_hand_sign(active_fingers)
- 
-        # ── Face emoji driven by hand_sign ──
-        if face_mesh is not None:
+        # ── Face emoji driven by facial expressions ──
+        if face_landmarker is not None:
             rgb_f    = cv2.cvtColor(flip, cv2.COLOR_BGR2RGB)
-            f_result = face_mesh.process(rgb_f)
-            if f_result.multi_face_landmarks:
-                fl         = f_result.multi_face_landmarks[0]
+            mp_image_f = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_f)
+            timestamp_ms = int(frame_index * 1000 / max(1, cap.get(cv2.CAP_PROP_FPS) or 30))
+            f_result = face_landmarker.detect_for_video(mp_image_f, timestamp_ms)
+            if f_result.face_landmarks:
+                fl         = f_result.face_landmarks[0]
                 face_bbox  = get_face_bbox_from_landmarks(fl, flip.shape[1], flip.shape[0])
                 emoji_scale= estimate_emoji_scale(face_bbox, body_pose_landmarks,
                                                   flip.shape[1], flip.shape[0])
-                draw_emoji_face(flip, face_bbox, hand_sign, emoji_scale)
+                if f_result.face_blendshapes:
+                    emoji_char, expression = classify_expression(f_result.face_blendshapes[0])
+                draw_emoji_face_pillow(flip, face_bbox, emoji_char, emoji_scale)
             annotated = cv2.flip(flip, 1)
         else:
             faces = detect_faces_opencv(flip)
             for face in faces:
                 emoji_scale = estimate_emoji_scale(face, body_pose_landmarks,
                                                    flip.shape[1], flip.shape[0])
-                draw_emoji_face(flip, face, hand_sign, emoji_scale)
+                draw_emoji_face_pillow(flip, face, "😐", emoji_scale)
             annotated = cv2.flip(flip, 1)
  
         # ── HUD ──
@@ -596,7 +706,7 @@ def run_all(source, backend, show_gui, headless, output_path, frame_limit=0):
             cv2.putText(annotated, ", ".join(dict.fromkeys(active_fingers)), (30,120),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
  
-        draw_sign_label(annotated, hand_sign)
+        draw_expression_label(annotated, expression)
         fps = 1.0/(time.time()-prev_time) if time.time()>prev_time else 0.0
         prev_time = time.time()
         draw_info(annotated,"All",fps)
@@ -619,8 +729,8 @@ def run_all(source, backend, show_gui, headless, output_path, frame_limit=0):
             if frame_limit and frame_index>=frame_limit: break
  
     if pose_landmarker: pose_landmarker.close()
-    if face_mesh:       face_mesh.close()
-    if hands:           hands.close()
+    if face_landmarker: face_landmarker.close()
+    if hand_landmarker: hand_landmarker.close()
     cap.release()
     cv2.destroyAllWindows()
     return 0
