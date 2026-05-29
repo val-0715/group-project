@@ -73,6 +73,8 @@ SIGN_LABELS = {
     "neutral":   "Other     -> Neutral",
 }
 
+PANEL_WIDTH = 250
+
 EMOJI_FONT_PATH = None
 for p in [
     "/System/Library/Fonts/Apple Color Emoji.ttc",
@@ -278,16 +280,19 @@ def draw_emoji_face(image, face_bbox, sign, scale=1.0):
     draw_emoji_face_pillow(image, face_bbox, emoji_char, scale)
 
 
-def draw_text_with_emoji(canvas, text, emoji, x, y, font_size=14, color=(200, 200, 200)):
+def draw_text_with_emoji(canvas, text, emoji, x, y, font_size=16, color=(200, 200, 200)):
+    # Calculate OpenCV font scale based on font_size (standard size 14 maps to 0.45 scale)
+    font_scale = font_size / 32.0  # e.g., 16 maps to 0.5, 20 maps to 0.625
+    
     # 1. Draw text with OpenCV
-    cv2.putText(canvas, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
-    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+    cv2.putText(canvas, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1, cv2.LINE_AA)
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
     
     # 2. Draw emoji using Pillow next to text
     emoji_x = x + tw + 6
     emoji_y = y - th - 2
     
-    base_size = 32
+    base_size = 48  # Use a larger base size to keep it crisp
     try:
         if EMOJI_FONT_PATH:
             font = ImageFont.truetype(EMOJI_FONT_PATH, size=base_size)
@@ -295,12 +300,12 @@ def draw_text_with_emoji(canvas, text, emoji, x, y, font_size=14, color=(200, 20
             font = ImageFont.load_default()
         
         # Create transparent canvas for emoji
-        emoji_canvas = Image.new("RGBA", (base_size + 10, base_size + 10), (0, 0, 0, 0))
+        emoji_canvas = Image.new("RGBA", (base_size + 15, base_size + 15), (0, 0, 0, 0))
         draw = ImageDraw.Draw(emoji_canvas)
         draw.text((5, 5), emoji, font=font, embedded_color=True)
         
         # Resize to target size
-        target_size = font_size + 4
+        target_size = int(font_size * 1.3)
         resized = emoji_canvas.resize((target_size, target_size), Image.Resampling.LANCZOS)
         
         # Crop canvas region and convert to PIL
@@ -317,10 +322,50 @@ def draw_text_with_emoji(canvas, text, emoji, x, y, font_size=14, color=(200, 20
         print(f"Error drawing label emoji: {e}")
 
 
-def draw_right_panel(frame, album_faces, current_expression):
+def safe_copy_roi(canvas, roi, x, y):
+    """
+    Safely copy roi image onto canvas at (x, y) coordinates,
+    handling any out-of-bounds or negative coordinates by clipping.
+    """
+    ch, cw = canvas.shape[:2]
+    rh, rw = roi.shape[:2]
+    
+    # Clip coordinates to canvas boundaries
+    x0 = max(0, x)
+    y0 = max(0, y)
+    x1 = min(cw, x + rw)
+    y1 = min(ch, y + rh)
+    
+    if x0 >= x1 or y0 >= y1:
+        return
+        
+    # Determine the corresponding slice of the ROI to copy
+    rx0 = x0 - x
+    ry0 = y0 - y
+    rx1 = rx0 + (x1 - x0)
+    ry1 = ry0 + (y1 - y0)
+    
+    canvas[y0:y1, x0:x1] = roi[ry0:ry1, rx0:rx1]
+
+
+def save_crop_file(key, face_crop, headless=False):
+    """
+    Saves a face crop image to disk. If headless is True and a valid,
+    non-empty crop image already exists on disk, it keeps the existing
+    one to preserve original images.
+    """
+    if headless and os.path.exists(f"{key}.png"):
+        existing = cv2.imread(f"{key}.png")
+        if existing is not None and existing.size > 0 and not np.all(existing == 0):
+            return existing
+    cv2.imwrite(f"{key}.png", face_crop)
+    return face_crop
+
+
+def draw_right_panel(frame, album_faces, current_expression, settings=None):
     # original frame size
     H, W = frame.shape[:2]
-    panel_w = 200
+    panel_w = PANEL_WIDTH
     
     # Create combined canvas of size (H, W + panel_w)
     canvas = np.zeros((H, W + panel_w, 3), dtype=np.uint8)
@@ -338,37 +383,42 @@ def draw_right_panel(frame, album_faces, current_expression):
         ("Surprise", "😲", "surprise")
     ]
     
-    # Dynamic box sizing to prevent out-of-bounds on small frames
-    box_h = min(80, int(slot_h * 0.7))
-    box_w = box_h
+    # Dynamic box sizing for side-by-side layout (larger boxes)
+    box_w = min(110, int(slot_h * 0.85))
+    if settings:
+        box_w = int(box_w * settings["picture_scale"])
+    box_h = box_w
     
     for idx, (label, emoji, key) in enumerate(expressions):
         # Calculate slot y-bounds
         y_start = idx * slot_h
         
-        # Center of slot: (W + panel_w // 2, y_start + slot_h // 2)
-        bx = W + (panel_w - box_w) // 2
+        # Position box on the right side of the panel
+        bx = W + panel_w - box_w - 15
         by = y_start + (slot_h - box_h) // 2
         
-        # Draw slot header / label using the helper function
-        th = max(8, int(slot_h * 0.12))
-        draw_text_with_emoji(canvas, label, emoji, W + 15, y_start + th + 10, font_size=12)
+        # Draw slot header / label centered vertically on the left with larger text
+        ty = y_start + slot_h // 2 + 5
+        font_sz = 16
+        if settings:
+            font_sz = int(font_sz * settings["text_scale"])
+        draw_text_with_emoji(canvas, label, emoji, W + 15, ty, font_size=font_sz)
         
         # Draw face crop if available, otherwise placeholder
         if key in album_faces:
             crop = album_faces[key]
             if crop is not None and crop.size > 0:
                 crop_resized = cv2.resize(crop, (box_w, box_h))
-                canvas[by:by+box_h, bx:bx+box_w] = crop_resized
+                safe_copy_roi(canvas, crop_resized, bx, by)
                 # Draw green border if it's the active one
                 border_color = (0, 255, 0) if current_expression == label else (150, 150, 150)
                 cv2.rectangle(canvas, (bx-1, by-1), (bx+box_w, by+box_h), border_color, 2)
         else:
-            # Placeholder: gray square with a dashed or thin border
+            # Placeholder: gray square
             cv2.rectangle(canvas, (bx, by), (bx+box_w, by+box_h), (80, 80, 80), 1)
-            # Draw question mark or instructions
+            # Draw question mark
             q_scale = max(0.5, box_h / 80.0)
-            cv2.putText(canvas, "?", (bx + int(box_w * 0.35), by + int(box_h * 0.65)), 
+            cv2.putText(canvas, "?", (bx + int(box_w * 0.38), by + int(box_h * 0.65)), 
                         cv2.FONT_HERSHEY_SIMPLEX, q_scale, (100, 100, 100), 2)
             
     return canvas
@@ -410,14 +460,28 @@ def draw_instructions_banner(frame, step_idx, flash_frames):
         cv2.addWeighted(flash_overlay, alpha, frame, 1.0 - alpha, 0, dst=frame)
 
 
-def draw_album_view(H, W_total, album_faces):
+def draw_album_view(H, W_total, album_faces, settings=None):
+    # Calculate base card size before scaling
+    card_w_base = min(200, int(W_total * 0.21))
+    
+    # Scale canvas dimensions if settings are active
+    if settings:
+        scale = settings["picture_scale"]
+        H = int(H * scale)
+        W_total = int(W_total * scale)
+        card_w = int(card_w_base * scale)
+    else:
+        card_w = card_w_base
+
     # Create background canvas
     canvas = np.zeros((H, W_total, 3), dtype=np.uint8)
     canvas[:] = (30, 28, 28) # Sleek dark slate
     
     # Title
     title = "YOUR EXPRESSION ALBUM"
-    title_scale = max(0.55, min(0.75, H / 640.0))
+    title_scale = max(0.7, min(1.0, H / 480.0))
+    if settings:
+        title_scale *= settings["text_scale"]
     (tw, th), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, title_scale, 2)
     tx = (W_total - tw) // 2
     cv2.putText(canvas, title, (tx, int(H * 0.12)), cv2.FONT_HERSHEY_SIMPLEX, title_scale, (0, 255, 255), 2, cv2.LINE_AA)
@@ -429,13 +493,12 @@ def draw_album_view(H, W_total, album_faces):
         ("Surprise", "😲", "surprise")
     ]
     
-    # Determine card size dynamically
-    card_w = min(160, int(W_total * 0.18))
     card_h = int(card_w * 1.35)
     
     # Spacing between cards:
     spacing = (W_total - 4 * card_w) // 5
-    card_y = (H - card_h) // 2 + int(H * 0.05)
+    # Center vertically but leave more room at the bottom for footer
+    card_y = max(10, (H - card_h) // 2 - 5)
     
     for idx, (label, emoji, key) in enumerate(expressions):
         card_x = spacing + idx * (card_w + spacing)
@@ -445,8 +508,8 @@ def draw_album_view(H, W_total, album_faces):
         # Draw thin gray border for the card
         cv2.rectangle(canvas, (card_x, card_y), (card_x + card_w, card_y + card_h), (200, 200, 200), 1)
         
-        # Photo area size: 85% of card width
-        photo_margin = int(card_w * 0.06)
+        # Photo area size: 90% of card width
+        photo_margin = int(card_w * 0.05)
         photo_x = card_x + photo_margin
         photo_y = card_y + photo_margin
         photo_w = card_w - 2 * photo_margin
@@ -458,32 +521,92 @@ def draw_album_view(H, W_total, album_faces):
             # Ensure crop has content
             if crop is not None and crop.size > 0:
                 crop_resized = cv2.resize(crop, (photo_w, photo_h))
-                canvas[photo_y:photo_y+photo_h, photo_x:photo_x+photo_w] = crop_resized
+                safe_copy_roi(canvas, crop_resized, photo_x, photo_y)
             else:
                 # Black fallback
                 cv2.rectangle(canvas, (photo_x, photo_y), (photo_x + photo_w, photo_y + photo_h), (0, 0, 0), -1)
         else:
             # Gray placeholder
             cv2.rectangle(canvas, (photo_x, photo_y), (photo_x + photo_w, photo_y + photo_h), (200, 200, 200), -1)
-            cv2.putText(canvas, "?", (photo_x + int(photo_w * 0.35), photo_y + int(photo_h * 0.65)), 
+            cv2.putText(canvas, "?", (photo_x + int(photo_w * 0.38), photo_y + int(photo_h * 0.65)), 
                         cv2.FONT_HERSHEY_SIMPLEX, photo_w / 80.0, (150, 150, 150), 2)
             
         # Draw photo frame border
         cv2.rectangle(canvas, (photo_x, photo_y), (photo_x + photo_w, photo_y + photo_h), (180, 180, 180), 1)
         
-        # Draw label text below photo
-        text_y = card_y + photo_margin + photo_h + int(card_h * 0.15)
-        font_sz = max(10, int(card_w * 0.08))
+        # Draw label text below photo (make font larger)
+        text_y = card_y + photo_margin + photo_h + int(card_h * 0.16)
+        font_sz = max(12, int(card_w * 0.09))
+        if settings:
+            font_sz = int(font_sz * settings["text_scale"])
         draw_text_with_emoji(canvas, label, emoji, card_x + photo_margin, text_y, font_size=font_sz, color=(40, 40, 40))
         
     # Draw instructions footer
     footer = "Press 'r' to Restart / Retake  |  Press 'q' to Quit"
-    footer_scale = max(0.35, min(0.45, H / 1000.0))
+    footer_scale = max(0.35, min(0.45, H / 700.0))
+    if settings:
+        footer_scale *= settings["text_scale"]
     (ftw, fth), _ = cv2.getTextSize(footer, cv2.FONT_HERSHEY_SIMPLEX, footer_scale, 1)
     ftx = (W_total - ftw) // 2
-    cv2.putText(canvas, footer, (ftx, H - 25), cv2.FONT_HERSHEY_SIMPLEX, footer_scale, (180, 180, 180), 1, cv2.LINE_AA)
+    cv2.putText(canvas, footer, (ftx, H - 12), cv2.FONT_HERSHEY_SIMPLEX, footer_scale, (180, 180, 180), 1, cv2.LINE_AA)
     
     return canvas
+
+
+def draw_settings_menu(canvas, selected_idx, settings):
+    H, W_total = canvas.shape[:2]
+    
+    # Backdrop width & height
+    box_w, box_h = 440, 220
+    bx = (W_total - box_w) // 2
+    by = (H - box_h) // 2
+    
+    # 1. Draw semi-transparent background
+    overlay = canvas.copy()
+    cv2.rectangle(overlay, (bx, by), (bx + box_w, by + box_h), (25, 25, 25), -1)
+    # Blend with original canvas (opacity 0.85)
+    cv2.addWeighted(overlay, 0.85, canvas, 0.15, 0, dst=canvas)
+    
+    # 2. Draw gold border
+    cv2.rectangle(canvas, (bx, by), (bx + box_w, by + box_h), (0, 215, 255), 2)
+    
+    # 3. Draw Title using Pillow helper to show emoji
+    title_y = by + 35
+    draw_text_with_emoji(canvas, "SETTINGS MENU", "⚙️", bx + 120, title_y, font_size=18, color=(0, 255, 255))
+    
+    # 4. Draw Option Rows
+    pic_scale = settings["picture_scale"]
+    text_scale = settings["text_scale"]
+    
+    row0_text = f"1. Picture / Card Size:  [ < ]  {pic_scale:.1f}x  [ > ]"
+    row1_text = f"2. Text / Emoji Size:   [ < ]  {text_scale:.1f}x  [ > ]"
+    
+    color0 = (0, 255, 0) if selected_idx == 0 else (200, 200, 200)
+    color1 = (0, 255, 0) if selected_idx == 1 else (200, 200, 200)
+    
+    # Option 0
+    tx0 = bx + 40
+    ty0 = by + 85
+    if selected_idx == 0:
+        cv2.putText(canvas, ">", (bx + 20, ty0), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+    cv2.putText(canvas, row0_text, (tx0, ty0), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color0, 1, cv2.LINE_AA)
+    
+    # Option 1
+    tx1 = bx + 40
+    ty1 = by + 125
+    if selected_idx == 1:
+        cv2.putText(canvas, ">", (bx + 20, ty1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+    cv2.putText(canvas, row1_text, (tx1, ty1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color1, 1, cv2.LINE_AA)
+    
+    # 5. Draw Instructions Footer
+    footer1 = "Use UP/DOWN (I/K) to select  |  LEFT/RIGHT (J/L) to adjust"
+    footer2 = "Press 's' or ENTER to close settings"
+    
+    f1x = bx + (box_w - cv2.getTextSize(footer1, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0][0]) // 2
+    f2x = bx + (box_w - cv2.getTextSize(footer2, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0][0]) // 2
+    
+    cv2.putText(canvas, footer1, (f1x, by + 175), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1, cv2.LINE_AA)
+    cv2.putText(canvas, footer2, (f2x, by + 195), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1, cv2.LINE_AA)
 
 
 
@@ -709,6 +832,11 @@ def run_face_tracking(source, backend, show_gui, headless, output_path, frame_li
     # Booth game states
     booth_state = 0
     flash_frames = 0
+    
+    # Settings menu state
+    booth_settings = {"picture_scale": 1.0, "text_scale": 1.0}
+    settings_open = False
+    selected_option = 0
  
     while cap.isOpened():
         ret, frame = cap.read()
@@ -720,8 +848,12 @@ def run_face_tracking(source, backend, show_gui, headless, output_path, frame_li
  
         if booth_state == 5:
             # Render Polaroid Album collage
-            annotated = draw_album_view(frame.shape[0], frame.shape[1] + 200, album_faces)
+            annotated = draw_album_view(frame.shape[0], frame.shape[1] + PANEL_WIDTH, album_faces, booth_settings)
             if headless:
+                # Apply custom settings for headless test
+                booth_settings["picture_scale"] = 1.3
+                booth_settings["text_scale"] = 1.2
+                annotated = draw_album_view(frame.shape[0], frame.shape[1] + PANEL_WIDTH, album_faces, booth_settings)
                 cv2.imwrite(output_path, annotated)
                 print(f"Saved completed album to {output_path}")
                 break
@@ -732,7 +864,10 @@ def run_face_tracking(source, backend, show_gui, headless, output_path, frame_li
             # Headless transition from state 4 to state 5
             if headless and booth_state == 4:
                 booth_state = 5
-                annotated = draw_album_view(frame.shape[0], frame.shape[1] + 200, album_faces)
+                # Apply custom settings for headless test
+                booth_settings["picture_scale"] = 1.3
+                booth_settings["text_scale"] = 1.2
+                annotated = draw_album_view(frame.shape[0], frame.shape[1] + PANEL_WIDTH, album_faces, booth_settings)
                 cv2.imwrite(output_path, annotated)
                 print(f"Saved completed album to {output_path}")
                 break
@@ -774,8 +909,7 @@ def run_face_tracking(source, backend, show_gui, headless, output_path, frame_li
                             if booth_state < 4:
                                 target_label, key, prompt = BOOTH_STEPS[booth_state]
                                 if expression == target_label or (headless and frame_index >= booth_state * 2):
-                                    album_faces[key] = face_crop
-                                    cv2.imwrite(f"{key}.png", face_crop)
+                                    album_faces[key] = save_crop_file(key, face_crop, headless)
                                     flash_frames = 5
                                     booth_state += 1
                         
@@ -784,16 +918,14 @@ def run_face_tracking(source, backend, show_gui, headless, output_path, frame_li
                     # Fallback crop for headless tests without landmarks
                     target_label, key, prompt = BOOTH_STEPS[booth_state]
                     face_crop = np.zeros((100, 100, 3), dtype=np.uint8)
-                    album_faces[key] = face_crop
-                    cv2.imwrite(f"{key}.png", face_crop)
+                    album_faces[key] = save_crop_file(key, face_crop, headless)
                     flash_frames = 5
                     booth_state += 1
             elif headless and booth_state < 4:
                 # Fallback crop for headless tests without face landmarker
                 target_label, key, prompt = BOOTH_STEPS[booth_state]
                 face_crop = np.zeros((100, 100, 3), dtype=np.uint8)
-                album_faces[key] = face_crop
-                cv2.imwrite(f"{key}.png", face_crop)
+                album_faces[key] = save_crop_file(key, face_crop, headless)
                 flash_frames = 5
                 booth_state += 1
                 
@@ -806,7 +938,10 @@ def run_face_tracking(source, backend, show_gui, headless, output_path, frame_li
             
             # ── Draw right panel last ──
             current_active = BOOTH_STEPS[booth_state][0] if (booth_state < 4) else "Neutral"
-            annotated = draw_right_panel(annotated, album_faces, current_active)
+            annotated = draw_right_panel(annotated, album_faces, current_active, booth_settings)
+            
+        if settings_open:
+            draw_settings_menu(annotated, selected_option, booth_settings)
             
         frame_index += 1
  
@@ -826,8 +961,34 @@ def run_face_tracking(source, backend, show_gui, headless, output_path, frame_li
                 album_faces.clear()
                 booth_state = 0
                 flash_frames = 0
-            if key in (13, 10, 32) and booth_state == 4:
-                booth_state = 5
+            if key in (ord("s"), ord("S")):
+                settings_open = not settings_open
+            
+            if settings_open:
+                # Up: macOS arrow key (0), Linux arrow key (82), or 'i'/'I'
+                if key in (0, 82, ord("i"), ord("I")):
+                    selected_option = (selected_option - 1) % 2
+                # Down: macOS arrow key (1), Linux arrow key (84), or 'k'/'K'
+                elif key in (1, 84, ord("k"), ord("K")):
+                    selected_option = (selected_option + 1) % 2
+                # Left (Decrease): macOS arrow key (2), Linux arrow key (81), or 'j'/'J'
+                elif key in (2, 81, ord("j"), ord("J")):
+                    if selected_option == 0:
+                        booth_settings["picture_scale"] = max(0.5, booth_settings["picture_scale"] - 0.1)
+                    else:
+                        booth_settings["text_scale"] = max(0.5, booth_settings["text_scale"] - 0.1)
+                # Right (Increase): macOS arrow key (3), Linux arrow key (83), or 'l'/'L'
+                elif key in (3, 83, ord("l"), ord("L")):
+                    if selected_option == 0:
+                        booth_settings["picture_scale"] = min(2.0, booth_settings["picture_scale"] + 0.1)
+                    else:
+                        booth_settings["text_scale"] = min(2.0, booth_settings["text_scale"] + 0.1)
+                # Enter/Space to close settings
+                elif key in (13, 10, 32):
+                    settings_open = False
+            else:
+                if key in (13, 10, 32) and booth_state == 4:
+                    booth_state = 5
         else:
             if frame_limit and frame_index>=frame_limit: break
  
@@ -926,6 +1087,11 @@ def run_all(source, backend, show_gui, headless, output_path, frame_limit=0):
     # Booth game states
     booth_state = 0
     flash_frames = 0
+    
+    # Settings menu state
+    booth_settings = {"picture_scale": 1.0, "text_scale": 1.0}
+    settings_open = False
+    selected_option = 0
  
     while cap.isOpened():
         ret, frame = cap.read()
@@ -939,8 +1105,12 @@ def run_all(source, backend, show_gui, headless, output_path, frame_limit=0):
             
         if booth_state == 5:
             # Render Polaroid Album collage
-            annotated = draw_album_view(flip.shape[0], flip.shape[1] + 200, album_faces)
+            annotated = draw_album_view(flip.shape[0], flip.shape[1] + PANEL_WIDTH, album_faces, booth_settings)
             if headless:
+                # Apply custom settings for headless test
+                booth_settings["picture_scale"] = 1.3
+                booth_settings["text_scale"] = 1.2
+                annotated = draw_album_view(flip.shape[0], flip.shape[1] + PANEL_WIDTH, album_faces, booth_settings)
                 cv2.imwrite(output_path, annotated)
                 print(f"Saved completed album to {output_path}")
                 break
@@ -953,7 +1123,10 @@ def run_all(source, backend, show_gui, headless, output_path, frame_limit=0):
             # Headless transition from state 4 to state 5
             if headless and booth_state == 4:
                 booth_state = 5
-                annotated = draw_album_view(flip.shape[0], flip.shape[1] + 200, album_faces)
+                # Apply custom settings for headless test
+                booth_settings["picture_scale"] = 1.3
+                booth_settings["text_scale"] = 1.2
+                annotated = draw_album_view(flip.shape[0], flip.shape[1] + PANEL_WIDTH, album_faces, booth_settings)
                 cv2.imwrite(output_path, annotated)
                 print(f"Saved completed album to {output_path}")
                 break
@@ -1015,8 +1188,7 @@ def run_all(source, backend, show_gui, headless, output_path, frame_limit=0):
                         if booth_state < 4:
                             target_label, key, prompt = BOOTH_STEPS[booth_state]
                             if expression == target_label or (headless and frame_index >= booth_state * 2):
-                                album_faces[key] = face_crop
-                                cv2.imwrite(f"{key}.png", face_crop)
+                                album_faces[key] = save_crop_file(key, face_crop, headless)
                                 flash_frames = 5
                                 booth_state += 1
                     
@@ -1025,16 +1197,14 @@ def run_all(source, backend, show_gui, headless, output_path, frame_limit=0):
                     # Fallback crop for headless tests without landmarks
                     target_label, key, prompt = BOOTH_STEPS[booth_state]
                     face_crop = np.zeros((100, 100, 3), dtype=np.uint8)
-                    album_faces[key] = face_crop
-                    cv2.imwrite(f"{key}.png", face_crop)
+                    album_faces[key] = save_crop_file(key, face_crop, headless)
                     flash_frames = 5
                     booth_state += 1
             elif headless and booth_state < 4:
                 # Fallback crop for headless tests without face landmarker
                 target_label, key, prompt = BOOTH_STEPS[booth_state]
                 face_crop = np.zeros((100, 100, 3), dtype=np.uint8)
-                album_faces[key] = face_crop
-                cv2.imwrite(f"{key}.png", face_crop)
+                album_faces[key] = save_crop_file(key, face_crop, headless)
                 flash_frames = 5
                 booth_state += 1
  
@@ -1055,7 +1225,10 @@ def run_all(source, backend, show_gui, headless, output_path, frame_limit=0):
  
             # ── Draw right panel last ──
             current_active = BOOTH_STEPS[booth_state][0] if (booth_state < 4) else "Neutral"
-            annotated = draw_right_panel(flip, album_faces, current_active)
+            annotated = draw_right_panel(flip, album_faces, current_active, booth_settings)
+            
+        if settings_open:
+            draw_settings_menu(annotated, selected_option, booth_settings)
             
         frame_index += 1
  
@@ -1075,8 +1248,34 @@ def run_all(source, backend, show_gui, headless, output_path, frame_limit=0):
                 album_faces.clear()
                 booth_state = 0
                 flash_frames = 0
-            if key in (13, 10, 32) and booth_state == 4:
-                booth_state = 5
+            if key in (ord("s"), ord("S")):
+                settings_open = not settings_open
+            
+            if settings_open:
+                # Up: macOS arrow key (0), Linux arrow key (82), or 'i'/'I'
+                if key in (0, 82, ord("i"), ord("I")):
+                    selected_option = (selected_option - 1) % 2
+                # Down: macOS arrow key (1), Linux arrow key (84), or 'k'/'K'
+                elif key in (1, 84, ord("k"), ord("K")):
+                    selected_option = (selected_option + 1) % 2
+                # Left (Decrease): macOS arrow key (2), Linux arrow key (81), or 'j'/'J'
+                elif key in (2, 81, ord("j"), ord("J")):
+                    if selected_option == 0:
+                        booth_settings["picture_scale"] = max(0.5, booth_settings["picture_scale"] - 0.1)
+                    else:
+                        booth_settings["text_scale"] = max(0.5, booth_settings["text_scale"] - 0.1)
+                # Right (Increase): macOS arrow key (3), Linux arrow key (83), or 'l'/'L'
+                elif key in (3, 83, ord("l"), ord("L")):
+                    if selected_option == 0:
+                        booth_settings["picture_scale"] = min(2.0, booth_settings["picture_scale"] + 0.1)
+                    else:
+                        booth_settings["text_scale"] = min(2.0, booth_settings["text_scale"] + 0.1)
+                # Enter/Space to close settings
+                elif key in (13, 10, 32):
+                    settings_open = False
+            else:
+                if key in (13, 10, 32) and booth_state == 4:
+                    booth_state = 5
         else:
             if frame_limit and frame_index>=frame_limit: break
  
